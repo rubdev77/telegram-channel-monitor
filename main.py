@@ -10,7 +10,8 @@ Architecture (two Pyrogram clients in one process):
   * BOT client  (BOT_TOKEN)       -> serves the interactive inline-keyboard
     admin UI (only bots may send InlineKeyboardMarkup).
 
-Persistence: SQLite (`bot_data.db`) — keywords, monitored channels, config.
+Persistence: PostgreSQL when DATABASE_URL is set (cloud, survives redeploys),
+otherwise local SQLite (`bot_data.db`) for development.
 Health check: aiohttp server on :8080 returning HTTP 200 "OK" at "/".
 """
 
@@ -74,97 +75,142 @@ DEFAULT_CONFIG = {
 }
 
 # --------------------------------------------------------------------------- #
-#  SQLite layer
+#  Database layer — PostgreSQL (cloud) when DATABASE_URL is set, else SQLite
 # --------------------------------------------------------------------------- #
 
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+USE_POSTGRES = bool(DATABASE_URL)
+
+if USE_POSTGRES:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+
+    IntegrityError = psycopg2.IntegrityError
+else:
+    IntegrityError = sqlite3.IntegrityError
+
 _db_lock = threading.Lock()
-_db = sqlite3.connect(DB_PATH, check_same_thread=False)
-_db.row_factory = sqlite3.Row
+_conn = None
+
+
+def _connect() -> None:
+    global _conn
+    if USE_POSTGRES:
+        _conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        _conn.autocommit = True
+        log.info("Connected to PostgreSQL")
+    else:
+        _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        _conn.row_factory = sqlite3.Row
+        log.info("Using local SQLite: %s", DB_PATH)
+
+
+def _exec(sql: str, params: tuple = (), fetch: bool = False):
+    """Run one query. Converts '?' placeholders for Postgres and transparently
+    reconnects once on dropped connections (cloud DBs close idle links)."""
+    global _conn
+    if USE_POSTGRES:
+        sql = sql.replace("?", "%s")
+    with _db_lock:
+        for attempt in (1, 2):
+            try:
+                if _conn is None:
+                    _connect()
+                cur = _conn.cursor()
+                try:
+                    cur.execute(sql, params)
+                    rows = cur.fetchall() if fetch else None
+                finally:
+                    cur.close()
+                if not USE_POSTGRES:
+                    _conn.commit()
+                return rows
+            except IntegrityError:
+                raise                      # duplicates — handled by callers
+            except Exception as e:
+                log.warning("DB error (attempt %d/2): %s — reconnecting", attempt, e)
+                try:
+                    _conn.close()
+                except Exception:
+                    pass
+                _conn = None
+                if attempt == 2:
+                    raise
 
 
 def init_db() -> None:
-    with _db_lock, _db:
-        _db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS keywords (
-                id   INTEGER PRIMARY KEY AUTOINCREMENT,
-                word TEXT NOT NULL UNIQUE COLLATE NOCASE
-            );
-            CREATE TABLE IF NOT EXISTS monitored_channels (
-                id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id  INTEGER NOT NULL UNIQUE,
-                username TEXT,
-                title    TEXT
-            );
-            CREATE TABLE IF NOT EXISTS config (
-                key   TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            """
-        )
-        for key, value in DEFAULT_CONFIG.items():
-            _db.execute(
-                "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
-                (key, value),
-            )
-
-
-def get_config(key: str, default: str = "") -> str:
-    with _db_lock:
-        row = _db.execute("SELECT value FROM config WHERE key = ?", (key,)).fetchone()
-    return row["value"] if row else default
-
-
-def set_config(key: str, value: str) -> None:
-    with _db_lock, _db:
-        _db.execute(
-            "INSERT INTO config (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    id_col = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    for stmt in (
+        f"CREATE TABLE IF NOT EXISTS keywords ("
+        f"  id {id_col}, word TEXT NOT NULL UNIQUE)",
+        f"CREATE TABLE IF NOT EXISTS monitored_channels ("
+        f"  id {id_col}, chat_id BIGINT NOT NULL UNIQUE, username TEXT, title TEXT)",
+        "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    ):
+        _exec(stmt)
+    for key, value in DEFAULT_CONFIG.items():
+        _exec(
+            "INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING"
+            if USE_POSTGRES else
+            "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
             (key, value),
         )
 
 
+# Config is cached in memory — the work-hours check runs on every incoming
+# post and must not hit a remote database each time.
+CONFIG_CACHE: dict[str, str] = {}
+
+
+def get_config(key: str, default: str = "") -> str:
+    return CONFIG_CACHE.get(key, default)
+
+
+def set_config(key: str, value: str) -> None:
+    _exec(
+        "INSERT INTO config (key, value) VALUES (?, ?) "
+        "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    CONFIG_CACHE[key] = value
+
+
 def db_add_keyword(word: str) -> bool:
     try:
-        with _db_lock, _db:
-            _db.execute("INSERT INTO keywords (word) VALUES (?)", (word.strip(),))
+        _exec("INSERT INTO keywords (word) VALUES (?)", (word.strip().lower(),))
         return True
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return False
 
 
 def db_remove_keyword(kw_id: int) -> None:
-    with _db_lock, _db:
-        _db.execute("DELETE FROM keywords WHERE id = ?", (kw_id,))
+    _exec("DELETE FROM keywords WHERE id = ?", (kw_id,))
 
 
-def db_list_keywords() -> list[sqlite3.Row]:
-    with _db_lock:
-        return _db.execute("SELECT id, word FROM keywords ORDER BY word").fetchall()
+def db_list_keywords() -> list:
+    return _exec("SELECT id, word FROM keywords ORDER BY word", fetch=True)
 
 
 def db_add_channel(chat_id: int, username: str | None, title: str) -> bool:
     try:
-        with _db_lock, _db:
-            _db.execute(
-                "INSERT INTO monitored_channels (chat_id, username, title) VALUES (?, ?, ?)",
-                (chat_id, username, title),
-            )
+        _exec(
+            "INSERT INTO monitored_channels (chat_id, username, title) VALUES (?, ?, ?)",
+            (chat_id, username, title),
+        )
         return True
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return False
 
 
 def db_remove_channel(row_id: int) -> None:
-    with _db_lock, _db:
-        _db.execute("DELETE FROM monitored_channels WHERE id = ?", (row_id,))
+    _exec("DELETE FROM monitored_channels WHERE id = ?", (row_id,))
 
 
-def db_list_channels() -> list[sqlite3.Row]:
-    with _db_lock:
-        return _db.execute(
-            "SELECT id, chat_id, username, title FROM monitored_channels ORDER BY title"
-        ).fetchall()
+def db_list_channels() -> list:
+    return _exec(
+        "SELECT id, chat_id, username, title FROM monitored_channels ORDER BY title",
+        fetch=True,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -179,6 +225,11 @@ def refresh_caches() -> None:
     global KEYWORDS, CHANNEL_IDS
     KEYWORDS = {row["word"].lower() for row in db_list_keywords()}
     CHANNEL_IDS = {row["chat_id"] for row in db_list_channels()}
+    CONFIG_CACHE.clear()
+    CONFIG_CACHE.update(
+        {row["key"]: row["value"]
+         for row in _exec("SELECT key, value FROM config", fetch=True)}
+    )
     log.info("Caches refreshed: %d keywords, %d channels", len(KEYWORDS), len(CHANNEL_IDS))
 
 
